@@ -1,0 +1,373 @@
+id: bottleneck_pipeline
+namespace: bottleneck.production
+description: |
+  Pipeline d'automatisation mensuel BottleNeck (Option B - Étape 3).
+  Orchestre le nettoyage DuckDB, la réconciliation, le calcul du CA (.xlsx),
+  la segmentation Z-Score Python (.csv) et les 5 contrôles qualité bloquants.
+
+inputs:
+  - id: dossier_entree
+    type: STRING
+    defaults: "/app/data/input"
+    description: "Répertoire contenant les sources Excel mensuelles (permet d'absorber de nouvelles sources)"
+  - id: seuil_zscore
+    type: FLOAT
+    defaults: 2.0
+    description: "Seuil statistique Z-Score pour identifier les vins millésimes/premium"
+
+variables:
+  dossier_staging: "/app/data/staging"
+
+tasks:
+  # =========================================================================
+  # ÉTAPE 1 : CONTRÔLE D'INGESTION DES 3 FICHIERS SOURCES
+  # =========================================================================
+  - id: etape_1_ingestion_et_staging
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: "Vérifie la lisibilité des 3 fichiers Excel sources avant traitement"
+    url: "jdbc:duckdb:"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    sql: |
+      INSTALL excel;
+      LOAD excel;
+
+      SELECT COUNT(*) AS nb_lignes_erp_brut FROM read_xlsx('{{ inputs.dossier_entree }}/erp.xlsx', header = true, all_varchar = true);
+      SELECT COUNT(*) AS nb_lignes_liaison_brut FROM read_xlsx('{{ inputs.dossier_entree }}/liaison.xlsx', header = true, all_varchar = true);
+      SELECT COUNT(*) AS nb_lignes_web_brut FROM read_xlsx('{{ inputs.dossier_entree }}/web.xlsx', header = true, all_varchar = true);
+
+  # =========================================================================
+  # ÉTAPE 2 : NETTOYAGE, DÉDOUBLONNAGE & TESTS QUALITÉ 1 & 2 (PARALLÈLE)
+  # =========================================================================
+  - id: etape_2_nettoyage_dedoublonnage
+    type: io.kestra.plugin.core.flow.Parallel
+    description: "Nettoyage parallèle des 3 sources suivi de leurs tests bloquants (doublons & valeurs manquantes)"
+    tasks:
+      # --- BRANCHE 1 : ERP ---
+      - id: pipeline_erp
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: nettoyer_erp
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            url: "jdbc:duckdb:"
+            retry:
+              type: constant
+              interval: PT10S
+              maxAttempts: 3
+            sql: |
+              INSTALL excel;
+              LOAD excel;
+
+              CREATE OR REPLACE TABLE erp_clean AS
+              SELECT
+                  CAST(TRIM(product_id) AS INTEGER) AS product_id,
+                  CAST(TRIM(onsale_web) AS INTEGER) AS onsale_web,
+                  CAST(REPLACE(TRIM(price), ',', '.') AS DOUBLE) AS price,
+                  CAST(TRIM(stock_quantity) AS INTEGER) AS stock_quantity,
+                  TRIM(stock_status) AS stock_status
+              FROM read_xlsx('{{ inputs.dossier_entree }}/erp.xlsx', header = true, all_varchar = true)
+              WHERE product_id IS NOT NULL
+                AND TRIM(product_id) <> ''
+                AND price IS NOT NULL
+                AND TRIM(price) <> ''
+              QUALIFY ROW_NUMBER() OVER (PARTITION BY CAST(TRIM(product_id) AS INTEGER) ORDER BY product_id) = 1;
+
+              COPY erp_clean TO '{{ vars.dossier_staging }}/erp_clean.parquet' (FORMAT PARQUET);
+
+          - id: test_qualite_erp
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            description: "Tests 1 & 2 (ERP) : 0 doublon sur product_id, 0 NULL et volumétrie exacte = 825"
+            url: "jdbc:duckdb:"
+            sql: |
+              SELECT
+                CASE
+                  WHEN COUNT(*) = 0
+                    THEN ERROR('[ECHEC TEST ERP] La table erp_clean est vide.')
+                  WHEN COUNT(*) <> COUNT(DISTINCT product_id)
+                    THEN ERROR('[ECHEC TEST 1 - DOUBLONS ERP] Doublons détectés sur product_id.')
+                  WHEN COUNT(*) FILTER (WHERE product_id IS NULL OR price IS NULL OR stock_quantity IS NULL) > 0
+                    THEN ERROR('[ECHEC TEST 2 - VALEURS MANQUANTES ERP] Valeurs NULL détectées.')
+                  WHEN COUNT(*) <> 825
+                    THEN ERROR('[ECHEC TEST VOLUMÉTRIE ERP] Attendu : 825 lignes | Obtenu : ' || CAST(COUNT(*) AS VARCHAR))
+                  ELSE '[SUCCÈS TESTS 1 & 2 ERP] 825 lignes uniques, 0 doublon, 0 valeur manquante.'
+                END AS statut_erp
+              FROM read_parquet('{{ vars.dossier_staging }}/erp_clean.parquet');
+
+      # --- BRANCHE 2 : LIAISON ---
+      - id: pipeline_liaison
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: nettoyer_liaison
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            url: "jdbc:duckdb:"
+            retry:
+              type: constant
+              interval: PT10S
+              maxAttempts: 3
+            sql: |
+              INSTALL excel;
+              LOAD excel;
+
+              CREATE OR REPLACE TABLE liaison_clean AS
+              SELECT
+                  CAST(TRIM(product_id) AS INTEGER) AS product_id,
+                  NULLIF(REGEXP_REPLACE(TRIM(id_web), '\.0$', ''), '') AS id_web
+              FROM read_xlsx('{{ inputs.dossier_entree }}/liaison.xlsx', header = true, all_varchar = true)
+              WHERE product_id IS NOT NULL
+                AND TRIM(product_id) <> ''
+              QUALIFY ROW_NUMBER() OVER (PARTITION BY CAST(TRIM(product_id) AS INTEGER) ORDER BY product_id) = 1;
+
+              COPY liaison_clean TO '{{ vars.dossier_staging }}/liaison_clean.parquet' (FORMAT PARQUET);
+
+          - id: test_qualite_liaison
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            description: "Tests 1 & 2 (Liaison) : 0 doublon sur product_id, 0 NULL sur clé ERP et volumétrie = 825"
+            url: "jdbc:duckdb:"
+            sql: |
+              SELECT
+                CASE
+                  WHEN COUNT(*) = 0
+                    THEN ERROR('[ECHEC TEST LIAISON] La table liaison_clean est vide.')
+                  WHEN COUNT(*) <> COUNT(DISTINCT product_id)
+                    THEN ERROR('[ECHEC TEST 1 - DOUBLONS LIAISON] Doublons détectés sur product_id.')
+                  WHEN COUNT(*) FILTER (WHERE product_id IS NULL) > 0
+                    THEN ERROR('[ECHEC TEST 2 - VALEURS MANQUANTES LIAISON] Clés product_id NULL détectées.')
+                  WHEN COUNT(*) <> 825
+                    THEN ERROR('[ECHEC TEST VOLUMÉTRIE LIAISON] Attendu : 825 lignes | Obtenu : ' || CAST(COUNT(*) AS VARCHAR))
+                  ELSE '[SUCCÈS TESTS 1 & 2 LIAISON] 825 correspondances uniques, 0 doublon.'
+                END AS statut_liaison
+              FROM read_parquet('{{ vars.dossier_staging }}/liaison_clean.parquet');
+
+      # --- BRANCHE 3 : WEB ---
+      - id: pipeline_web
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: nettoyer_web
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            url: "jdbc:duckdb:"
+            retry:
+              type: constant
+              interval: PT10S
+              maxAttempts: 3
+            sql: |
+              INSTALL excel;
+              LOAD excel;
+
+              -- 1. Suppression des valeurs manquantes sur SKU (1 428 lignes conservées)
+              CREATE OR REPLACE TABLE web_sans_null AS
+              SELECT
+                  REGEXP_REPLACE(TRIM(sku), '\.0$', '') AS sku,
+                  CAST(COALESCE(NULLIF(TRIM(total_sales), ''), '0') AS DOUBLE) AS total_sales,
+                  TRIM(post_title) AS post_title,
+                  TRIM(post_name) AS post_name,
+                  TRIM(post_type) AS post_type,
+                  TRIM(post_date) AS post_date
+              FROM read_xlsx('{{ inputs.dossier_entree }}/web.xlsx', header = true, all_varchar = true)
+              WHERE sku IS NOT NULL
+                AND TRIM(sku) <> '';
+
+              -- 2. Dédoublonnage sur la clé produit WooCommerce (714 lignes uniques)
+              CREATE OR REPLACE TABLE web_clean AS
+              SELECT
+                  sku,
+                  CAST(total_sales AS INTEGER) AS total_sales,
+                  post_title,
+                  post_name
+              FROM web_sans_null
+              WHERE post_type = 'product'
+              QUALIFY ROW_NUMBER() OVER (PARTITION BY sku ORDER BY post_date DESC) = 1;
+
+              COPY web_sans_null TO '{{ vars.dossier_staging }}/web_sans_null.parquet' (FORMAT PARQUET);
+              COPY web_clean TO '{{ vars.dossier_staging }}/web_clean.parquet' (FORMAT PARQUET);
+
+          - id: test_qualite_web
+            type: io.kestra.plugin.jdbc.duckdb.Queries
+            description: "Tests 1 & 2 (Web) : 1 428 lignes sans NULL, puis 714 produits uniques sans doublon"
+            url: "jdbc:duckdb:"
+            sql: |
+              SELECT
+                CASE
+                  WHEN (SELECT COUNT(*) FROM read_parquet('{{ vars.dossier_staging }}/web_sans_null.parquet')) <> 1428
+                    THEN ERROR('[ECHEC TEST 2 - WEB SANS NULL] Attendu : 1428 lignes | Obtenu : ' ||
+                      CAST((SELECT COUNT(*) FROM read_parquet('{{ vars.dossier_staging }}/web_sans_null.parquet')) AS VARCHAR))
+                  WHEN COUNT(*) <> COUNT(DISTINCT sku)
+                    THEN ERROR('[ECHEC TEST 1 - DOUBLONS WEB] Doublons détectés sur sku.')
+                  WHEN COUNT(*) FILTER (WHERE sku IS NULL OR total_sales IS NULL OR post_title IS NULL) > 0
+                    THEN ERROR('[ECHEC TEST 2 - VALEURS MANQUANTES WEB] Valeurs NULL détectées après nettoyage.')
+                  WHEN COUNT(*) <> 714
+                    THEN ERROR('[ECHEC TEST VOLUMÉTRIE WEB] Attendu : 714 lignes | Obtenu : ' || CAST(COUNT(*) AS VARCHAR))
+                  ELSE '[SUCCÈS TESTS 1 & 2 WEB] 1428 lignes nettoyées -> 714 produits uniques, 0 doublon, 0 NULL.'
+                END AS statut_web
+              FROM read_parquet('{{ vars.dossier_staging }}/web_clean.parquet');
+
+  # =========================================================================
+  # ÉTAPE 3 : RÉCONCILIATION DES 3 SOURCES & TEST 3 (COHÉRENCE JOINTURE)
+  # =========================================================================
+  - id: etape_3_reconciliation_et_ca
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: "Jointure ERP <-> Liaison <-> Web et calcul du CA par produit"
+    url: "jdbc:duckdb:"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    sql: |
+      CREATE OR REPLACE TABLE ventes_fusionnees AS
+      SELECT
+          e.product_id,
+          w.sku AS id_web,
+          w.post_title AS produit,
+          e.price AS prix_unitaire,
+          w.total_sales AS quantite_vendue,
+          ROUND(e.price * w.total_sales, 2) AS ca_produit,
+          e.stock_quantity,
+          e.stock_status
+      FROM read_parquet('{{ vars.dossier_staging }}/erp_clean.parquet') e
+      INNER JOIN read_parquet('{{ vars.dossier_staging }}/liaison_clean.parquet') l
+          ON e.product_id = l.product_id
+      INNER JOIN read_parquet('{{ vars.dossier_staging }}/web_clean.parquet') w
+          ON l.id_web = w.sku
+      ORDER BY ca_produit DESC, e.product_id ASC;
+
+      COPY ventes_fusionnees TO '{{ vars.dossier_staging }}/ventes_fusionnees.parquet' (FORMAT PARQUET);
+
+  - id: test_3_coherence_jointure
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: "Test 3 : Vérifie l'intégrité référentielle et la volumétrie (714 lignes) post-jointure"
+    url: "jdbc:duckdb:"
+    sql: |
+      SELECT
+        CASE
+          WHEN COUNT(*) <> 714
+            THEN ERROR('[ECHEC TEST 3 - VOLUMÉTRIE JOINTURE] Attendu : 714 lignes | Obtenu : ' || CAST(COUNT(*) AS VARCHAR))
+          WHEN COUNT(*) <> COUNT(DISTINCT product_id) OR COUNT(*) <> COUNT(DISTINCT id_web)
+            THEN ERROR('[ECHEC TEST 3 - CLÉS JOINTURE] Perte d''unicité détectée après jointure.')
+          WHEN COUNT(*) FILTER (WHERE product_id IS NULL OR id_web IS NULL OR prix_unitaire IS NULL OR quantite_vendue IS NULL OR ca_produit IS NULL) > 0
+            THEN ERROR('[ECHEC TEST 3 - NULL POST-JOINTURE] Valeurs manquantes détectées dans la table fusionnée.')
+          ELSE '[SUCCÈS TEST 3 - JOINTURE] 714 produits réconciliés sans perte ni doublon.'
+        END AS statut_jointure
+      FROM read_parquet('{{ vars.dossier_staging }}/ventes_fusionnees.parquet');
+
+  - id: exporter_table_fusionnee_ion
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: "jdbc:duckdb:"
+    fetchType: STORE
+    sql: |
+      SELECT * FROM read_parquet('{{ vars.dossier_staging }}/ventes_fusionnees.parquet')
+      ORDER BY ca_produit DESC, product_id ASC;
+
+  - id: convertir_fusion_en_csv
+    type: io.kestra.plugin.serdes.csv.IonToCsv
+    from: "{{ outputs.exporter_table_fusionnee_ion.uri }}"
+
+  # =========================================================================
+  # ÉTAPE 4 : BRANCHES MÉTIERS & TESTS 4 & 5 (CA EXCEL + Z-SCORE CSV)
+  # =========================================================================
+  - id: etape_4_branches_metiers
+    type: io.kestra.plugin.core.flow.Parallel
+    description: "Exécution parallèle des exports métiers avec validation bloquante du CA et du Z-score"
+    tasks:
+      # --- BRANCHE 1 : RAPPORT EXCEL & TEST 4 (COHÉRENCE CA) ---
+      - id: branche_rapport_ca_excel
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Calcule le CA par produit/global, exécute le Test 4 et génère rapport_ca_bottleneck.xlsx"
+        beforeCommands:
+          - pip install --quiet pandas openpyxl
+        inputFiles:
+          ventes_fusionnees.csv: "{{ outputs.convertir_fusion_en_csv.uri }}"
+        outputFiles:
+          - "rapport_ca_bottleneck.xlsx"
+        script: |
+          import pandas as pd
+
+          df = pd.read_csv("ventes_fusionnees.csv")
+
+          # Calcul du chiffre d'affaires par produit et global
+          df["ca_calcule"] = (df["prix_unitaire"] * df["quantite_vendue"]).round(2)
+          ca_total = round(float(df["ca_calcule"].sum()), 2)
+          total_bouteilles = int(df["quantite_vendue"].sum())
+          nb_references = len(df)
+
+          # === TEST 4 : COHÉRENCE DU CHIFFRE D'AFFAIRES ===
+          assert df["ca_calcule"].isna().sum() == 0, "[ECHEC TEST 4] Valeurs manquantes dans le CA."
+          assert (df["ca_calcule"] < 0).sum() == 0, "[ECHEC TEST 4] Chiffre d'affaires négatif détecté."
+          assert ((df["ca_calcule"] - df["ca_produit"]).abs() < 0.01).all(), "[ECHEC TEST 4] Écart entre CA DuckDB et Python."
+          assert abs(ca_total - 70568.60) < 0.01, f"[ECHEC TEST 4] CA global attendu : 70568.60 EUR | Obtenu : {ca_total:.2f} EUR"
+          print(f"[SUCCÈS TEST 4 - COHÉRENCE CA] CA global validé = {ca_total:.2f} EUR sur {nb_references} références.")
+
+          df_ca_produit = df[[
+              "product_id", "id_web", "produit",
+              "prix_unitaire", "quantite_vendue", "ca_calcule"
+          ]].rename(columns={"ca_calcule": "ca_produit"})
+
+          df_synthese = pd.DataFrame([
+              {"Indicateur": "Chiffre d'affaires global (EUR)", "Valeur": ca_total},
+              {"Indicateur": "Nombre total de bouteilles vendues", "Valeur": total_bouteilles},
+              {"Indicateur": "Nombre de références actives vendues en ligne", "Valeur": nb_references},
+              {"Indicateur": "Prix unitaire moyen (EUR)", "Valeur": round(float(df["prix_unitaire"].mean()), 2)},
+              {"Indicateur": "Statut contrôle qualité Test 4", "Valeur": "VALIDÉ (70 568,60 EUR)"}
+          ])
+
+          with pd.ExcelWriter("rapport_ca_bottleneck.xlsx", engine="openpyxl") as writer:
+              df_ca_produit.to_excel(writer, sheet_name="CA_par_produit", index=False)
+              df_synthese.to_excel(writer, sheet_name="Synthese_CA_Global", index=False)
+
+      # --- BRANCHE 2 : SEGMENTATION Z-SCORE & TEST 5 (VOLUMÉTRIE MILLÉSIMES) ---
+      - id: branche_segmentation_zscore_csv
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Segmente les vins via Z-score, exécute le Test 5 et génère les 2 extractions CSV"
+        beforeCommands:
+          - pip install --quiet pandas
+        inputFiles:
+          ventes_fusionnees.csv: "{{ outputs.convertir_fusion_en_csv.uri }}"
+        outputFiles:
+          - "vins_premium.csv"
+          - "vins_ordinaires.csv"
+        script: |
+          import pandas as pd
+
+          df = pd.read_csv("ventes_fusionnees.csv")
+          seuil = float("{{ inputs.seuil_zscore }}")
+
+          moyenne_prix = float(df["prix_unitaire"].mean())
+          ecart_type_prix = float(df["prix_unitaire"].std())
+          assert ecart_type_prix > 0, "[ECHEC TEST 5] Écart-type nul : impossible de calculer le Z-score."
+
+          df["z_score"] = ((df["prix_unitaire"] - moyenne_prix) / ecart_type_prix).round(4)
+
+          df_premium = df[df["z_score"] > seuil].sort_values(by="prix_unitaire", ascending=False)
+          df_ordinaires = df[df["z_score"] <= seuil].sort_values(by="prix_unitaire", ascending=False)
+
+          # === TEST 5 : COHÉRENCE DE LA SEGMENTATION Z-SCORE ===
+          assert df["z_score"].isna().sum() == 0, "[ECHEC TEST 5] Valeurs NaN dans le calcul du Z-score."
+          assert len(df_premium) + len(df_ordinaires) == 714, f"[ECHEC TEST 5] Somme des segments != 714 ({len(df_premium) + len(df_ordinaires)})."
+          assert len(df_premium) == 30, f"[ECHEC TEST 5] Vins millésimes attendus : 30 | Obtenus : {len(df_premium)}"
+          assert len(df_ordinaires) == 684, f"[ECHEC TEST 5] Vins ordinaires attendus : 684 | Obtenus : {len(df_ordinaires)}"
+          assert df_premium["prix_unitaire"].min() > df_ordinaires["prix_unitaire"].max(), "[ECHEC TEST 5] Chevauchement de prix entre segments."
+          print(f"[SUCCÈS TEST 5 - Z-SCORE] 30 vins millésimes (z > {seuil}) et 684 vins ordinaires validés.")
+
+          df_premium.to_csv("vins_premium.csv", index=False, encoding="utf-8-sig")
+          df_ordinaires.to_csv("vins_ordinaires.csv", index=False, encoding="utf-8-sig")
+
+# ===========================================================================
+# GESTION CENTRALISÉE DES ERREURS / PANNES (RÉSILIENCE)
+# ===========================================================================
+errors:
+  - id: alerte_panne_pipeline
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: |
+      [ALERTE CRITIQUE BOTTLENECK] Échec du workflow {{ flow.id }} (Exécution : {{ execution.id }}).
+      Un contrôle qualité bloquant a échoué ou un composant (DuckDB / fichier source) est indisponible.
+      Aucun livrable corrompu n'a été validé. Consultez l'onglet Logs pour identifier la règle en échec.
+
+# ===========================================================================
+# PLANIFICATION AUTOMATIQUE (CRON : TOUS LES 15 DU MOIS À 9H00)
+# ===========================================================================
+triggers:
+  - id: planification_mensuelle_15_du_mois
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+    timezone: Europe/Paris

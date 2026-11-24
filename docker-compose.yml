@@ -1,0 +1,27 @@
+services:
+  kestra:
+    image: kestra/kestra:latest
+    container_name: bottleneck-kestra
+    user: "root"
+    command: server local
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+      - ./data:/app/data
+      - ./flows:/app/flows
+    environment:
+      KESTRA_CONFIGURATION: |
+        kestra:
+          server:
+            basicAuth:
+              enabled: true
+              username: ${KESTRA_ADMIN_EMAIL}
+              password: ${KESTRA_ADMIN_PASSWORD}
+    restart: unless-stopped
+
+volumes:
+  kestra-data:

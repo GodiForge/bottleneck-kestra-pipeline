@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+node_modules/
+dist/
+build/
+*.log
+# Exclusions système et caches automatiques GodiForge
+AppData/
+Desktop/
+Temp/
+Logs/
+scripts/
+architecture/
+
+
+# Exclusions internes Kestra & donnees temporaires (BottleNeck)
+data/main/
+data/staging/
+data/output/*
+!data/output/.gitkeep
+*.tmp

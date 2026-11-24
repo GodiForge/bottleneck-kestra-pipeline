@@ -1,0 +1,51 @@
+id: bottleneck_pipeline_etape1_squelette
+namespace: bottleneck.production
+description: |
+  Squelette d'architecture du pipeline BottleNeck (Option B).
+  Cartographie les étapes de nettoyage, jointure, calcul CA, segmentation Z-score et tests qualité.
+
+tasks:
+  - id: etape_1_validation_sources
+    type: io.kestra.plugin.core.log.Log
+    message: "Vérification de la présence des fichiers sources dans /app/data/input (erp.xlsx, liaison.xlsx, web.xlsx)..."
+
+  - id: etape_2_nettoyage_et_tests_qualite
+    type: io.kestra.plugin.core.flow.Parallel
+    description: "Nettoyage et dédoublonnage parallèle des 3 sources + contrôles qualité (825 / 825 / 714 lignes)"
+    tasks:
+      - id: branch_erp
+        type: io.kestra.plugin.core.log.Log
+        message: "[ERP] Nettoyage NULL + Dédoublonnage + Test 825 lignes"
+      - id: branch_liaison
+        type: io.kestra.plugin.core.log.Log
+        message: "[LIAISON] Nettoyage NULL + Dédoublonnage + Test 825 lignes"
+      - id: branch_web
+        type: io.kestra.plugin.core.log.Log
+        message: "[WEB] Nettoyage NULL (1428 lignes) + Dédoublonnage + Test 714 lignes"
+
+  - id: etape_3_jointure_et_test
+    type: io.kestra.plugin.core.log.Log
+    message: "[JOINTURE] Fusion ERP <-> Liaison <-> Web + Test cohérence (714 lignes attendues)"
+
+  - id: etape_4_calculs_et_segmentation
+    type: io.kestra.plugin.core.flow.Parallel
+    description: "Branches parallèles : calcul des CA (.xlsx) et segmentation Z-score (.csv)"
+    tasks:
+      - id: branch_chiffre_affaires
+        type: io.kestra.plugin.core.log.Log
+        message: "[CA] Calcul CA par produit & CA global + Test (70 568,60 EUR) + Export rapport_ca.xlsx"
+      - id: branch_segmentation_zscore
+        type: io.kestra.plugin.core.log.Log
+        message: "[Z-SCORE] Segmentation Python (z > 2) + Test (30 millésimes / 684 ordinaires) + Exports CSV"
+
+errors:
+  - id: gestion_panne_pipeline
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: "ALERTE BOTTLENECK : Échec d'exécution du pipeline (vérifier disponibilité DuckDB ou intégrité des fichiers Excel)."
+
+triggers:
+  - id: planification_mensuelle_15_du_mois
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+    timezone: Europe/Paris

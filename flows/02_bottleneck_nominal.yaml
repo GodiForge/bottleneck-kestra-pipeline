@@ -1,0 +1,282 @@
+id: bottleneck_pipeline
+namespace: bottleneck.production
+description: |
+  Pipeline d'automatisation mensuel BottleNeck (Option B - Étape 2).
+  Orchestre le nettoyage DuckDB, la réconciliation, le calcul du CA (.xlsx),
+  la segmentation Z-Score Python (.csv), la planification Cron et la gestion d'erreurs.
+
+inputs:
+  - id: dossier_entree
+    type: STRING
+    defaults: "/app/data/input"
+    description: "Répertoire contenant les sources Excel mensuelles (permet d'absorber de nouvelles sources)"
+  - id: seuil_zscore
+    type: FLOAT
+    defaults: 2.0
+    description: "Seuil statistique Z-Score pour identifier les vins millésimes/premium"
+
+variables:
+  dossier_staging: "/app/data/staging"
+
+tasks:
+  # =========================================================================
+  # ÉTAPE 1 : CONTRÔLE D'INGESTION & PRÉPARATION DU STAGING
+  # =========================================================================
+  - id: etape_1_ingestion_et_staging
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: "Vérifie la lisibilité des 3 fichiers Excel sources et prépare l'espace de staging"
+    url: "jdbc:duckdb:"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    sql: |
+      INSTALL excel;
+      LOAD excel;
+
+      SELECT COUNT(*) AS nb_lignes_erp_brut FROM read_xlsx('{{ inputs.dossier_entree }}/erp.xlsx', header = true, all_varchar = true);
+      SELECT COUNT(*) AS nb_lignes_liaison_brut FROM read_xlsx('{{ inputs.dossier_entree }}/liaison.xlsx', header = true, all_varchar = true);
+      SELECT COUNT(*) AS nb_lignes_web_brut FROM read_xlsx('{{ inputs.dossier_entree }}/web.xlsx', header = true, all_varchar = true);
+
+  # =========================================================================
+  # ÉTAPE 2 : NETTOYAGE & DÉDOUBLONNAGE PARALLÈLE (DUCKDB SQL)
+  # =========================================================================
+  - id: etape_2_nettoyage_dedoublonnage
+    type: io.kestra.plugin.core.flow.Parallel
+    description: "Suppression des valeurs manquantes et dédoublonnage des 3 sources en parallèle"
+    tasks:
+      - id: nettoyer_erp
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        url: "jdbc:duckdb:"
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+        sql: |
+          INSTALL excel;
+          LOAD excel;
+
+          CREATE OR REPLACE TABLE erp_clean AS
+          SELECT
+              CAST(TRIM(product_id) AS INTEGER) AS product_id,
+              CAST(TRIM(onsale_web) AS INTEGER) AS onsale_web,
+              CAST(REPLACE(TRIM(price), ',', '.') AS DOUBLE) AS price,
+              CAST(TRIM(stock_quantity) AS INTEGER) AS stock_quantity,
+              TRIM(stock_status) AS stock_status
+          FROM read_xlsx('{{ inputs.dossier_entree }}/erp.xlsx', header = true, all_varchar = true)
+          WHERE product_id IS NOT NULL
+            AND TRIM(product_id) <> ''
+            AND price IS NOT NULL
+            AND TRIM(price) <> ''
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY CAST(TRIM(product_id) AS INTEGER) ORDER BY product_id) = 1;
+
+          COPY erp_clean TO '{{ vars.dossier_staging }}/erp_clean.parquet' (FORMAT PARQUET);
+
+      - id: nettoyer_liaison
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        url: "jdbc:duckdb:"
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+        sql: |
+          INSTALL excel;
+          LOAD excel;
+
+          CREATE OR REPLACE TABLE liaison_clean AS
+          SELECT
+              CAST(TRIM(product_id) AS INTEGER) AS product_id,
+              NULLIF(REGEXP_REPLACE(TRIM(id_web), '\.0$', ''), '') AS id_web
+          FROM read_xlsx('{{ inputs.dossier_entree }}/liaison.xlsx', header = true, all_varchar = true)
+          WHERE product_id IS NOT NULL
+            AND TRIM(product_id) <> ''
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY CAST(TRIM(product_id) AS INTEGER) ORDER BY product_id) = 1;
+
+          COPY liaison_clean TO '{{ vars.dossier_staging }}/liaison_clean.parquet' (FORMAT PARQUET);
+
+      - id: nettoyer_web
+        type: io.kestra.plugin.jdbc.duckdb.Queries
+        url: "jdbc:duckdb:"
+        retry:
+          type: constant
+          interval: PT10S
+          maxAttempts: 3
+        sql: |
+          INSTALL excel;
+          LOAD excel;
+
+          -- 1. Suppression des valeurs manquantes sur SKU (1 428 lignes conservées)
+          CREATE OR REPLACE TABLE web_sans_null AS
+          SELECT
+              REGEXP_REPLACE(TRIM(sku), '\.0$', '') AS sku,
+              CAST(COALESCE(NULLIF(TRIM(total_sales), ''), '0') AS DOUBLE) AS total_sales,
+              TRIM(post_title) AS post_title,
+              TRIM(post_name) AS post_name,
+              TRIM(post_type) AS post_type,
+              TRIM(post_date) AS post_date
+          FROM read_xlsx('{{ inputs.dossier_entree }}/web.xlsx', header = true, all_varchar = true)
+          WHERE sku IS NOT NULL
+            AND TRIM(sku) <> '';
+
+          -- 2. Dédoublonnage sur la clé produit WooCommerce (714 lignes uniques)
+          CREATE OR REPLACE TABLE web_clean AS
+          SELECT
+              sku,
+              CAST(total_sales AS INTEGER) AS total_sales,
+              post_title,
+              post_name
+          FROM web_sans_null
+          WHERE post_type = 'product'
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY sku ORDER BY post_date DESC) = 1;
+
+          COPY web_sans_null TO '{{ vars.dossier_staging }}/web_sans_null.parquet' (FORMAT PARQUET);
+          COPY web_clean TO '{{ vars.dossier_staging }}/web_clean.parquet' (FORMAT PARQUET);
+
+  # =========================================================================
+  # ÉTAPE 3 : RÉCONCILIATION (JOINTURE) & CALCUL DU CHIFFRE D'AFFAIRES
+  # =========================================================================
+  - id: etape_3_reconciliation_et_ca
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: "Jointure ERP <-> Liaison <-> Web et calcul du CA par produit et global"
+    url: "jdbc:duckdb:"
+    retry:
+      type: constant
+      interval: PT10S
+      maxAttempts: 3
+    sql: |
+      CREATE OR REPLACE TABLE ventes_fusionnees AS
+      SELECT
+          e.product_id,
+          w.sku AS id_web,
+          w.post_title AS produit,
+          e.price AS prix_unitaire,
+          w.total_sales AS quantite_vendue,
+          ROUND(e.price * w.total_sales, 2) AS ca_produit,
+          e.stock_quantity,
+          e.stock_status
+      FROM read_parquet('{{ vars.dossier_staging }}/erp_clean.parquet') e
+      INNER JOIN read_parquet('{{ vars.dossier_staging }}/liaison_clean.parquet') l
+          ON e.product_id = l.product_id
+      INNER JOIN read_parquet('{{ vars.dossier_staging }}/web_clean.parquet') w
+          ON l.id_web = w.sku
+      ORDER BY ca_produit DESC, e.product_id ASC;
+
+      COPY ventes_fusionnees TO '{{ vars.dossier_staging }}/ventes_fusionnees.parquet' (FORMAT PARQUET);
+
+  - id: exporter_table_fusionnee_ion
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    description: "Charge la table fusionnée dans le stockage interne Kestra pour les tâches Python"
+    url: "jdbc:duckdb:"
+    fetchType: STORE
+    sql: |
+      SELECT * FROM read_parquet('{{ vars.dossier_staging }}/ventes_fusionnees.parquet')
+      ORDER BY ca_produit DESC, product_id ASC;
+
+  - id: convertir_fusion_en_csv
+    type: io.kestra.plugin.serdes.csv.IonToCsv
+    description: "Convertit le flux interne Kestra en CSV standard UTF-8"
+    from: "{{ outputs.exporter_table_fusionnee_ion.uri }}"
+
+  # =========================================================================
+  # ÉTAPE 4 : BRANCHES PARALLÈLES (RAPPORT EXCEL CA & SEGMENTATION Z-SCORE)
+  # =========================================================================
+  - id: etape_4_branches_metiers
+    type: io.kestra.plugin.core.flow.Parallel
+    description: "Exécution parallèle du rapport financier (.xlsx) et de la segmentation Z-Score (.csv)"
+    tasks:
+      # ---------------------------------------------------------------------
+      # BRANCHE 1 : GÉNÉRATION DU RAPPORT EXCEL DU CHIFFRE D'AFFAIRES
+      # ---------------------------------------------------------------------
+      - id: branche_rapport_ca_excel
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Génère le rapport Excel avec le CA par produit et le CA global"
+        beforeCommands:
+          - pip install --quiet pandas openpyxl
+        inputFiles:
+          ventes_fusionnees.csv: "{{ outputs.convertir_fusion_en_csv.uri }}"
+        outputFiles:
+          - "rapport_ca_bottleneck.xlsx"
+        script: |
+          import pandas as pd
+
+          df = pd.read_csv("ventes_fusionnees.csv")
+
+          # Onglet 1 : Chiffre d'affaires détaillé par produit
+          df_ca_produit = df[[
+              "product_id", "id_web", "produit",
+              "prix_unitaire", "quantite_vendue", "ca_produit"
+          ]].copy()
+
+          # Onglet 2 : Synthèse du chiffre d'affaires global
+          ca_total = round(df_ca_produit["ca_produit"].sum(), 2)
+          total_bouteilles = int(df_ca_produit["quantite_vendue"].sum())
+          nb_references = len(df_ca_produit)
+
+          df_synthese = pd.DataFrame([
+              {"Indicateur": "Chiffre d'affaires global (EUR)", "Valeur": ca_total},
+              {"Indicateur": "Nombre total de bouteilles vendues", "Valeur": total_bouteilles},
+              {"Indicateur": "Nombre de références actives vendues en ligne", "Valeur": nb_references},
+              {"Indicateur": "Prix unitaire moyen (EUR)", "Valeur": round(df_ca_produit["prix_unitaire"].mean(), 2)}
+          ])
+
+          with pd.ExcelWriter("rapport_ca_bottleneck.xlsx", engine="openpyxl") as writer:
+              df_ca_produit.to_excel(writer, sheet_name="CA_par_produit", index=False)
+              df_synthese.to_excel(writer, sheet_name="Synthese_CA_Global", index=False)
+
+          print(f"[SUCCÈS EXCEL] Rapport généré : CA global = {ca_total:.2f} EUR sur {nb_references} références.")
+
+      # ---------------------------------------------------------------------
+      # BRANCHE 2 : SEGMENTATION STATISTIQUE Z-SCORE & EXPORTS CSV
+      # ---------------------------------------------------------------------
+      - id: branche_segmentation_zscore_csv
+        type: io.kestra.plugin.scripts.python.Script
+        description: "Identifie les vins millésimes (z > 2) et ordinaires (z <= 2) et génère les CSV"
+        beforeCommands:
+          - pip install --quiet pandas
+        inputFiles:
+          ventes_fusionnees.csv: "{{ outputs.convertir_fusion_en_csv.uri }}"
+        outputFiles:
+          - "vins_premium.csv"
+          - "vins_ordinaires.csv"
+        script: |
+          import pandas as pd
+
+          df = pd.read_csv("ventes_fusionnees.csv")
+          seuil = float("{{ inputs.seuil_zscore }}")
+
+          # Calcul du Z-score : z = (prix - moyenne) / écart-type
+          moyenne_prix = df["prix_unitaire"].mean()
+          ecart_type_prix = df["prix_unitaire"].std()
+          df["z_score"] = ((df["prix_unitaire"] - moyenne_prix) / ecart_type_prix).round(4)
+
+          # Branchement logique : Vins premium (millésimes) vs Vins ordinaires
+          df_premium = df[df["z_score"] > seuil].sort_values(by="prix_unitaire", ascending=False)
+          df_ordinaires = df[df["z_score"] <= seuil].sort_values(by="prix_unitaire", ascending=False)
+
+          df_premium.to_csv("vins_premium.csv", index=False, encoding="utf-8-sig")
+          df_ordinaires.to_csv("vins_ordinaires.csv", index=False, encoding="utf-8-sig")
+
+          print(f"Moyenne des prix : {moyenne_prix:.2f} EUR | Écart-type : {ecart_type_prix:.2f} EUR")
+          print(f"[SUCCÈS CSV] Vins premium (z > {seuil}) : {len(df_premium)} vins -> vins_premium.csv (Laure B2B)")
+          print(f"[SUCCÈS CSV] Vins ordinaires (z <= {seuil}) : {len(df_ordinaires)} vins -> vins_ordinaires.csv (Maria B2C)")
+
+# ===========================================================================
+# GESTION CENTRALISÉE DES ERREURS / PANNES (RÉSILIENCE)
+# ===========================================================================
+errors:
+  - id: alerte_panne_pipeline
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: |
+      [ALERTE CRITIQUE BOTTLENECK] Échec du workflow {{ flow.id }} (Exécution : {{ execution.id }}).
+      Cause probable : indisponibilité du moteur DuckDB/Docker ou fichier source manquant/corrompu dans {{ inputs.dossier_entree }}.
+      Action requise : vérifier les logs de la tâche en erreur et relancer le workflow via le bouton Replay.
+
+# ===========================================================================
+# PLANIFICATION AUTOMATIQUE (CRON : TOUS LES 15 DU MOIS À 9H00)
+# ===========================================================================
+triggers:
+  - id: planification_mensuelle_15_du_mois
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+    timezone: Europe/Paris
