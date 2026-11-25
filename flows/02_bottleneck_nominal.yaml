@@ -1,7 +1,7 @@
 id: bottleneck_pipeline
 namespace: bottleneck.production
 description: |
-  Pipeline d'automatisation mensuel BottleNeck (Option B - Étape 2).
+  Pipeline d'automatisation mensuel BottleNeck.
   Orchestre le nettoyage DuckDB, la réconciliation, le calcul du CA (.xlsx),
   la segmentation Z-Score Python (.csv), la planification Cron et la gestion d'erreurs.
 

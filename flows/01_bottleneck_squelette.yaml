@@ -1,7 +1,7 @@
 id: bottleneck_pipeline_etape1_squelette
 namespace: bottleneck.production
 description: |
-  Squelette d'architecture du pipeline BottleNeck (Option B).
+  Squelette d'architecture du pipeline BottleNeck.
   Cartographie les étapes de nettoyage, jointure, calcul CA, segmentation Z-score et tests qualité.
 
 tasks:
